@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
+
 # ----------------------------------------
 # Constants
 # ----------------------------------------
@@ -351,6 +352,206 @@ def collect_slugs_by_category(
         browser.close()
 
     return slugs
+
+
+# Async Playwright: slug collection for Colab/Jupyter
+
+
+async def async_collect_slugs_by_category(category_id: str,
+                                           pages_dir: Path) -> list[str]:
+    """
+    Async version of collect_slugs_by_category for use in Colab/Jupyter
+    environments where a sync_playwright() call would conflict with the
+    existing event loop.
+    """
+    from playwright.async_api import async_playwright, TimeoutError as AsyncTimeout
+
+    category_url = f"{BASE_URL}/category/{category_id}"
+    query_key    = f"category_{category_id}"
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        pw_page = await browser.new_page()
+
+        print(f"  Loading: {category_url}")
+        await pw_page.goto(category_url)
+        await pw_page.wait_for_load_state("networkidle")
+
+        await async_dismiss_cookie_banner(pw_page)
+        slugs = await async_collect_all_slugs(pw_page, query_key, pages_dir)
+        await browser.close()
+
+    return slugs
+
+
+async def async_collect_slugs_by_keyword(keyword: str,
+                                          pages_dir: Path) -> list[str]:
+    """
+    Async version of collect_slugs_by_keyword for use in Colab/Jupyter
+    environments where a sync_playwright() call would conflict with the
+    existing event loop.
+    """
+    from playwright.async_api import async_playwright
+
+    query_key = "keyword_" + re.sub(r"[^a-z0-9]+", "_",
+                                     keyword.lower()).strip("_")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        pw_page = await browser.new_page()
+
+        print(f"  Opening homepage...")
+        await pw_page.goto(f"{BASE_URL}/home")
+        await pw_page.wait_for_load_state("networkidle")
+
+        await async_dismiss_cookie_banner(pw_page)
+
+        print(f"  Submitting search: '{keyword}'")
+        search_box = pw_page.locator("input[type='text']").first
+        await search_box.click()
+        await search_box.fill(keyword)
+        await search_box.press("Enter")
+        await pw_page.wait_for_load_state("networkidle")
+
+        slugs = await async_collect_all_slugs(pw_page, query_key, pages_dir)
+        await browser.close()
+
+    return slugs
+
+
+async def async_dismiss_cookie_banner(page) -> bool:
+    """Async version of dismiss_cookie_banner."""
+    selector = "button[type='button'][onclick='setCookiePolicy()']"
+
+    try:
+        btn   = page.locator(selector)
+        count = await btn.count()
+
+        if count == 0:
+            print("    No cookie banner detected — continuing.")
+            return False
+
+        if count > 1:
+            raise RuntimeError(
+                f"Cookie banner: expected 1 button matching {selector!r}, "
+                f"found {count}. The page structure may have changed."
+            )
+
+        actual_text   = await btn.first.inner_text(timeout=3_000)
+        actual_text   = actual_text.strip()
+        expected_text = "Continue"
+        if actual_text != expected_text:
+            raise RuntimeError(
+                f"Cookie banner: button text is {actual_text!r}, "
+                f"expected {expected_text!r}. Refusing to click."
+            )
+
+        print(f"    Cookie banner found: "
+              f"<button onclick='setCookiePolicy()'>{actual_text}</button>"
+              f" — clicking...")
+        await btn.first.click()
+        await page.wait_for_load_state("networkidle")
+
+        if await btn.count() > 0 and await btn.first.is_visible(timeout=2_000):
+            raise RuntimeError(
+                "Cookie banner button is still visible after clicking."
+            )
+
+        print("    Cookie banner dismissed ✓")
+        return True
+
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Cookie banner: unexpected error — {e}") from e
+
+
+async def async_wait_for_objects(page, timeout: int = 15_000) -> bool:
+    """Async version of wait_for_objects."""
+    try:
+        await page.wait_for_load_state("networkidle", timeout=timeout)
+        return len(extract_slugs_from_html(await page.content())) > 0
+    except Exception:
+        screenshot_path = "playwright_debug.png"
+        await page.screenshot(path=screenshot_path)
+        print(f"\n    ✗ Timed out waiting for page to load.")
+        print(f"    Screenshot saved → {screenshot_path}")
+        print(f"    Current URL: {page.url}")
+        print(f"    Page title:  {await page.title()}")
+        return False
+
+
+async def async_navigate_to_next_page(page, next_page_num: int) -> bool:
+    """Async version of navigate_to_next_page."""
+    target = str(next_page_num)
+
+    async def click_page_number() -> bool:
+        for link in await page.locator("a").all():
+            try:
+                if (await link.inner_text(timeout=300)).strip() == target:
+                    await link.click()
+                    await page.wait_for_load_state("networkidle")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if await click_page_number():
+        return True
+
+    try:
+        next_pages = page.get_by_text("Next pages").first
+        if await next_pages.is_visible(timeout=2_000):
+            await next_pages.click()
+            await page.wait_for_load_state("networkidle")
+            if await click_page_number():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+async def async_collect_all_slugs(page, query_key: str,
+                                   pages_dir: Path) -> list[str]:
+    """Async version of collect_all_slugs."""
+    all_slugs    = []
+    seen         = set()
+    current_page = 1
+
+    while True:
+        print(f"    Page {current_page}...", end=" ", flush=True)
+        found = await async_wait_for_objects(page)
+
+        if not found:
+            print("    Trying extended wait...", end=" ", flush=True)
+            await page.wait_for_timeout(5_000)
+
+        html      = await page.content()
+        html_path = pages_dir / f"{query_key}_page{current_page}.html"
+        html_path.write_text(html, encoding="utf-8")
+        slug_count = len(extract_slugs_from_html(html))
+        print(f"    HTML saved → {html_path.name}  "
+              f"({slug_count} object references found)")
+
+        page_slugs = extract_slugs_from_html(html)
+        new_slugs  = [s for s in page_slugs if s not in seen]
+        seen.update(new_slugs)
+        all_slugs.extend(new_slugs)
+        print(f"{len(new_slugs)} new objects (running total: {len(all_slugs)})")
+
+        if not new_slugs and not found:
+            print("\n    Could not find any object links on this page.")
+            break
+
+        if not await async_navigate_to_next_page(page, current_page + 1):
+            print("    No further pages — slug collection complete.")
+            break
+
+        current_page += 1
+        time.sleep(0.5)
+
+    return all_slugs
 
 
 # ----------------------------------------
